@@ -1,5 +1,5 @@
-# Validate pull-request body hygiene without executing repository code.
-# Every check ignores complete HTML blockquote regions as quoted upstream content.
+# Validate pull-request body and commit-message hygiene without executing repository code.
+# Body checks ignore complete HTML blockquote regions as quoted upstream content.
 name: Repository hygiene
 
 # Runs on pull_request: the checks need no secret and no write access.
@@ -53,7 +53,17 @@ jobs:
               pr = api(f"/pulls/{number}")
               if pr["head"]["sha"] != event["pull_request"]["head"]["sha"]:
                   raise ValueError(f"Pull request #{number} changed; run the check again")
-              return {"pull_requests": [{"number": number, "body": pr["body"] or ""}]}
+              commits = []
+              for page in (1, 2, 3):
+                  batch = api(f"/pulls/{number}/commits?per_page=100&page={page}")
+                  commits += batch
+                  if len(batch) < 100:
+                      break
+              if not commits or len(commits) != pr["commits"] or pr["head"]["sha"] not in {c["sha"] for c in commits}:
+                  raise ValueError(f"Pull request #{number} commits could not be read in full")
+              return {"pull_requests": [{"number": number, "body": pr["body"] or ""}],
+                      "commits": [{"sha": c["sha"], "message": c["commit"]["message"],
+                                   "parents": len(c["parents"])} for c in commits]}
 
           def unquoted(body):
               starts = [0] + [m.end() for m in re.finditer("\n", body)]
@@ -89,20 +99,29 @@ jobs:
 
           def check(mode, data):
               bodies = [(f"Pull request #{p['number']} body", unquoted(p["body"])) for p in data["pull_requests"]]
+              messages = [(f"Commit {c['sha'][:12]} message", c["message"]) for c in data["commits"]]
+              subjects = [(f"Commit {c['sha'][:12]} message", c["message"].split("\n", 1)[0])
+                          for c in data["commits"] if c["parents"] <= 1]
               tests = {
-                  "task-lists": (re.compile(r"^\s*[-*+]\s+\[[ xX]\]"), bodies,
+                  "commit-subjects": (re.compile(r"^(?!(?:feat|fix|docs|test|ci|chore|refactor|perf|build|revert|style)(?:\([^()\r\n]+\))?!?: \S)"), subjects,
+                                      "use a Conventional Commits subject such as fix(scope): text; types: feat fix docs test ci chore refactor perf build revert style"),
+                  "task-lists": (re.compile(r"^\s*(?:>\s*)*(?:[-*+]|\d+[.)])\s*\[[ xX]\]"), bodies,
                                  "replace task-list markup with plain text"),
                   "local-paths": (re.compile(r"(?<![\w:/<])(?:/(?:home|Users|tmp|private|root|srv|mnt|media|Volumes|workspace|workspaces)(?:/|(?=$|[\s<>\[\]()`'\"]))|[A-Za-z]:[\\/]|\\\\[^\s]+|~/)"),
                                   bodies, "use a repository-relative path or a full web URL"),
-                  "attribution": (re.compile(r"^\s*Co-authored-by\s*:", re.I), bodies,
-                                  "remove the additional author trailer"),
-                  "conversation-links": (re.compile(r"(?:https?://)?(?:www\.)?(?:claude\.ai/(?:code|share)|(?:chatgpt\.com|chat\.openai\.com)/share|opencode\.ai/s/)", re.I),
-                                         bodies, "remove the external conversation link"),
+                  "author-trailers": (re.compile(r"^\s*Co-authored-by\s*:", re.I), bodies + messages,
+                                      "remove the additional author trailer"),
+                  "session-trailers": (re.compile(r"^\s*[A-Za-z0-9][A-Za-z0-9-]*-Session\s*:", re.I), bodies + messages,
+                                       "remove the session trailer"),
+                  "tool-attribution": (re.compile(r"^[\W_]*(?:generated|created|written|made|authored|built)\s+(?:with|by|using|via)\s+[\W_]*(?:claude|chatgpt|codex|copilot|cursor|opencode|gemini|grok|aider|devin|openai|anthropic)(?=[\W_]|$)", re.I),
+                                       bodies + messages, "remove the tool attribution line"),
+                  "conversation-links": (re.compile(r"(?:https?://)?(?:www\.)?(?:claude\.ai/(?:code|share)|(?:chatgpt\.com|chat\.openai\.com)/share|opencode\.ai/s/|chatgpt\.com/codex|app\.devin\.ai/sessions)", re.I),
+                                         bodies + messages, "remove the external conversation link"),
               }
               findings = []
               pattern, sources, message = tests[mode]
               for label, text in sources:
-                  for line, value in enumerate(text.splitlines(), 1):
+                  for line, value in enumerate(text.splitlines() or [""], 1):
                       if pattern.search(value):
                           findings.append(f"{label} line {line}: {message}")
               for finding in findings:
@@ -125,6 +144,9 @@ jobs:
                   sys.exit(1)
           PY
           python3 "$RUNNER_TEMP/org-gate.py" collect
+      - name: Check commit subjects
+        if: ${{ !cancelled() && steps.metadata.outcome == 'success' }}
+        run: python3 "$RUNNER_TEMP/org-gate.py" commit-subjects
       - name: Check task-list markup
         if: ${{ !cancelled() && steps.metadata.outcome == 'success' }}
         run: python3 "$RUNNER_TEMP/org-gate.py" task-lists
@@ -133,7 +155,13 @@ jobs:
         run: python3 "$RUNNER_TEMP/org-gate.py" local-paths
       - name: Check author trailers
         if: ${{ !cancelled() && steps.metadata.outcome == 'success' }}
-        run: python3 "$RUNNER_TEMP/org-gate.py" attribution
+        run: python3 "$RUNNER_TEMP/org-gate.py" author-trailers
+      - name: Check session trailers
+        if: ${{ !cancelled() && steps.metadata.outcome == 'success' }}
+        run: python3 "$RUNNER_TEMP/org-gate.py" session-trailers
+      - name: Check attribution lines
+        if: ${{ !cancelled() && steps.metadata.outcome == 'success' }}
+        run: python3 "$RUNNER_TEMP/org-gate.py" tool-attribution
       - name: Check external conversation links
         if: ${{ !cancelled() && steps.metadata.outcome == 'success' }}
         run: python3 "$RUNNER_TEMP/org-gate.py" conversation-links
