@@ -2,16 +2,19 @@
 # Every check ignores complete HTML blockquote regions as quoted upstream content.
 name: Repository hygiene
 
-# Runs happen on opened, synchronize, and reopened pull requests.
+# Runs on pull_request: the checks need no secret and no write access.
+# Rulesets run it only on opened, synchronize and reopened, so re-run the job after editing a body.
 # Add merge_group together with a merge queue.
 on:
-  pull_request_target:
+  pull_request:
 
 permissions:
   pull-requests: read
 
 jobs:
   hygiene:
+    # Rulesets need a conditional to run a pull_request workflow outside its source repository.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -44,7 +47,7 @@ jobs:
                   return json.load(response)
 
           def collect(event, kind):
-              if kind != "pull_request_target":
+              if kind != "pull_request":
                   raise ValueError("Unsupported event")
               number = int(event["number"])
               pr = api(f"/pulls/{number}")
