@@ -1,0 +1,136 @@
+# Validate pull-request body hygiene without executing repository code.
+# Every check ignores complete HTML blockquote regions as quoted upstream content.
+name: Repository hygiene
+
+# Runs happen on opened, synchronize, and reopened pull requests.
+# Add merge_group together with a merge queue.
+on:
+  pull_request_target:
+
+permissions:
+  pull-requests: read
+
+jobs:
+  hygiene:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Read pull-request metadata
+        id: metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/org-gate.py" <<'PY'
+          import json
+          from html.parser import HTMLParser
+          import os
+          from pathlib import Path
+          import re
+          import sys
+          import urllib.error
+          import urllib.request
+
+          DATA = Path(os.environ["RUNNER_TEMP"]) / "org-gate.json"
+
+          def api(path):
+              request = urllib.request.Request(
+                  os.environ["GITHUB_API_URL"] + "/repos/" + os.environ["GITHUB_REPOSITORY"] + path,
+                  headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                           "Accept": "application/vnd.github+json",
+                           "X-GitHub-Api-Version": "2022-11-28"}, method="GET")
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
+
+          def collect(event, kind):
+              if kind != "pull_request_target":
+                  raise ValueError("Unsupported event")
+              number = int(event["number"])
+              pr = api(f"/pulls/{number}")
+              if pr["head"]["sha"] != event["pull_request"]["head"]["sha"]:
+                  raise ValueError(f"Pull request #{number} changed; run the check again")
+              return {"pull_requests": [{"number": number, "body": pr["body"] or ""}]}
+
+          def unquoted(body):
+              starts = [0] + [m.end() for m in re.finditer("\n", body)]
+
+              class Quotes(HTMLParser):
+                  def __init__(self):
+                      super().__init__(convert_charrefs=False)
+                      self.depth, self.start, self.spans = 0, 0, []
+
+                  def source_index(self):
+                      line, column = self.getpos()
+                      return starts[line - 1] + column
+
+                  def handle_starttag(self, tag, attrs):
+                      if tag == "blockquote":
+                          if not self.depth:
+                              self.start = self.source_index()
+                          self.depth += 1
+
+                  def handle_endtag(self, tag):
+                      if tag == "blockquote" and self.depth:
+                          self.depth -= 1
+                          if not self.depth:
+                              self.spans.append((self.start, body.index(">", self.source_index()) + 1))
+
+              parser = Quotes()
+              parser.feed(body)
+              parser.close()
+              result = list(body)
+              for start, end in parser.spans:
+                  result[start:end] = [c if c in "\r\n" else " " for c in body[start:end]]
+              return "".join(result)
+
+          def check(mode, data):
+              bodies = [(f"Pull request #{p['number']} body", unquoted(p["body"])) for p in data["pull_requests"]]
+              tests = {
+                  "task-lists": (re.compile(r"^\s*[-*+]\s+\[[ xX]\]"), bodies,
+                                 "replace task-list markup with plain text"),
+                  "local-paths": (re.compile(r"(?<![\w:/<])(?:/(?:home|Users|tmp|private|root|srv|mnt|media|Volumes|workspace|workspaces)(?:/|(?=$|[\s<>\[\]()`'\"]))|[A-Za-z]:[\\/]|\\\\[^\s]+|~/)"),
+                                  bodies, "use a repository-relative path or a full web URL"),
+                  "attribution": (re.compile(r"^\s*Co-authored-by\s*:", re.I), bodies,
+                                  "remove the additional author trailer"),
+                  "conversation-links": (re.compile(r"(?:https?://)?(?:www\.)?(?:claude\.ai/(?:code|share)|(?:chatgpt\.com|chat\.openai\.com)/share|opencode\.ai/s/)", re.I),
+                                         bodies, "remove the external conversation link"),
+              }
+              findings = []
+              pattern, sources, message = tests[mode]
+              for label, text in sources:
+                  for line, value in enumerate(text.splitlines(), 1):
+                      if pattern.search(value):
+                          findings.append(f"{label} line {line}: {message}")
+              for finding in findings:
+                  print("::error::" + finding)
+              if not findings:
+                  print(mode + ": passed")
+              return bool(findings)
+
+          if __name__ == "__main__":
+              try:
+                  mode = sys.argv[1]
+                  if mode == "collect":
+                      event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+                      DATA.write_text(json.dumps(collect(event, os.environ["GITHUB_EVENT_NAME"])))
+                      print("Pull-request metadata collected")
+                  else:
+                      sys.exit(check(mode, json.loads(DATA.read_text())))
+              except (OSError, ValueError, KeyError, TypeError, urllib.error.URLError):
+                  print("::error::Repository metadata could not be validated; retry the check or reduce the pull request size")
+                  sys.exit(1)
+          PY
+          python3 "$RUNNER_TEMP/org-gate.py" collect
+      - name: Check task-list markup
+        if: ${{ !cancelled() && steps.metadata.outcome == 'success' }}
+        run: python3 "$RUNNER_TEMP/org-gate.py" task-lists
+      - name: Check local paths
+        if: ${{ !cancelled() && steps.metadata.outcome == 'success' }}
+        run: python3 "$RUNNER_TEMP/org-gate.py" local-paths
+      - name: Check author trailers
+        if: ${{ !cancelled() && steps.metadata.outcome == 'success' }}
+        run: python3 "$RUNNER_TEMP/org-gate.py" attribution
+      - name: Check external conversation links
+        if: ${{ !cancelled() && steps.metadata.outcome == 'success' }}
+        run: python3 "$RUNNER_TEMP/org-gate.py" conversation-links
