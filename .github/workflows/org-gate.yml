@@ -4,9 +4,11 @@ name: Repository hygiene
 
 # Runs on pull_request: the checks need no secret and no write access.
 # Rulesets run it only on opened, synchronize and reopened, so re-run the job after editing a body.
-# Add merge_group together with a merge queue.
+# Runs on merge_group too, because a merge queue waits for every required check on the queued commit.
 on:
   pull_request:
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   pull-requests: read
@@ -14,12 +16,18 @@ permissions:
 jobs:
   hygiene:
     # Rulesets need a conditional to run a pull_request workflow outside its source repository.
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
+      - name: Pass the merge group
+        if: github.event_name == 'merge_group'
+        run: |
+          echo "Each queued pull request passed this check on pull_request: its body and every commit."
+          echo "A push to a queued pull request removes it from the queue, so the queued commits are the ones checked."
       - name: Read pull-request metadata
         id: metadata
+        if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
